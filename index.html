@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>Treasure Match</title>
+<style>
+body{margin:0;touch-action:manipulation;-webkit-tap-highlight-color:transparent;background:#1b1426;color:#f5e6b8;font-family:Georgia,serif;display:flex;flex-direction:column;align-items:center}
+h1{margin:10px 0 4px;font-size:24px;color:#ffd75e}
+#hud{display:flex;gap:18px;align-items:center;margin-bottom:6px}
+button{background:#7a4b16;color:#ffe9a8;border:2px solid #ffd75e;border-radius:6px;padding:4px 12px;font:inherit;cursor:pointer}
+canvas{border:3px solid #6b4a1e;border-radius:8px;background:#2a1d10;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;width:min(96vw,calc((100vh - 110px)*0.6));height:auto}
+#modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center}
+#box{background:#2d1f3d;border:3px solid #ffd75e;border-radius:10px;padding:18px;text-align:center;max-width:280px}
+</style></head><body>
+<h1>Treasure Match</h1>
+<div id="hud"><span>Score: <b id="score">0</b></span><span>Moves: <b id="moves">0</b></span><button id="restart">Restart</button></div>
+<canvas id="c"></canvas>
+<div id="modal"><div id="box"><p id="msg"></p><div id="btns"></div></div></div>
+<script>
+// ===== Tuning constants =====
+const COLS = 6, ROWS = 10, TILE = 56;
+const TYPES = ['ruby','emerald','sapphire','amethyst','topaz','coin'];
+const MYSTERY = 'mystery';
+const MYSTERY_CHANCE = 0.03;      // chance a newly spawned piece is a mystery piece
+const MYSTERY_WIN_ODDS = 0.5;     // chance accept = bonus (else game over)
+const MYSTERY_BONUS = 500;
+const POINTS_PER_PIECE = 10;
+const SWAP_MS = 140, CLEAR_MS = 220, FALL_SPEED = 0.025; // fall speed in tiles per ms
+const DRAG_THRESHOLD = TILE * 0.35;
+
+// ===== State =====
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = COLS * TILE; cv.height = ROWS * TILE;
+let grid, score, moves, busy, selected, gameOver, anims, t0 = performance.now();
+// cell: {type, y (visual row, float), clearing (0..1 or -1)}
+
+const rnd = a => a[Math.floor(Math.random() * a.length)];
+function newPiece(allowMystery) {
+  return { type: allowMystery && Math.random() < MYSTERY_CHANCE ? MYSTERY : rnd(TYPES), y: 0, dx: 0, dy: 0, clear: -1 };
+}
+function init() {
+  grid = [];
+  for (let c = 0; c < COLS; c++) { grid[c] = []; for (let r = 0; r < ROWS; r++) {
+    let p; do { p = newPiece(false); } while (
+      (r >= 2 && grid[c][r-1].type === p.type && grid[c][r-2].type === p.type) ||
+      (c >= 2 && grid[c-1][r].type === p.type && grid[c-2][r].type === p.type));
+    p.y = r; grid[c][r] = p; } }
+  score = 0; moves = 0; busy = false; selected = null; gameOver = false;
+  hideModal(); updHud();
+}
+function updHud() { document.getElementById('score').textContent = score; document.getElementById('moves').textContent = moves; }
+
+// ===== Matching =====
+function findMatches() {
+  const m = new Set();
+  const t = (c, r) => grid[c][r] && grid[c][r].type !== MYSTERY ? grid[c][r].type : null;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS - 2; c++) {
+    const k = t(c, r); if (!k) continue; let e = c; while (e + 1 < COLS && t(e + 1, r) === k) e++;
+    if (e - c >= 2) for (let i = c; i <= e; i++) m.add(i + ',' + r); c = e; }
+  for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS - 2; r++) {
+    const k = t(c, r); if (!k) continue; let e = r; while (e + 1 < ROWS && t(c, e + 1) === k) e++;
+    if (e - r >= 2) for (let i = r; i <= e; i++) m.add(c + ',' + i); r = e; }
+  return [...m].map(s => s.split(',').map(Number));
+}
+
+// ===== Animation helpers =====
+const wait = ms => new Promise(res => setTimeout(res, ms));
+function tween(ms, fn) { return new Promise(res => { const s = performance.now();
+  (function f(n) { const k = Math.min(1, (n - s) / ms); fn(k); k < 1 ? requestAnimationFrame(f) : res(); })(s); }); }
+
+async function animateSwap(a, b) {
+  const pa = grid[a[0]][a[1]], pb = grid[b[0]][b[1]];
+  const ddx = b[0] - a[0], ddy = b[1] - a[1];
+  await tween(SWAP_MS, k => { pa.dx = ddx * k; pa.dy = ddy * k; pb.dx = -ddx * k; pb.dy = -ddy * k; });
+  pa.dx = pa.dy = pb.dx = pb.dy = 0;
+  grid[a[0]][a[1]] = pb; grid[b[0]][b[1]] = pa;
+}
+async function clearCells(cells) {
+  const ps = cells.map(([c, r]) => grid[c][r]).filter(Boolean);
+  await tween(CLEAR_MS, k => ps.forEach(p => p.clear = k));
+  cells.forEach(([c, r]) => grid[c][r] = null);
+}
+async function collapse() {
+  for (let c = 0; c < COLS; c++) {
+    let w = ROWS - 1;
+    for (let r = ROWS - 1; r >= 0; r--) if (grid[c][r]) { const p = grid[c][r]; grid[c][r] = null; grid[c][w--] = p; }
+    let spawn = -1;
+    for (let r = w; r >= 0; r--) { const p = newPiece(true); p.y = spawn--; grid[c][r] = p; }
+  }
+  // gravity: fall until each piece reaches its row
+  await new Promise(res => { let last = performance.now();
+    (function f(n) { const dt = n - last; last = n; let moving = false;
+      for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS; r++) { const p = grid[c][r];
+        if (p.y < r) { p.y = Math.min(r, p.y + FALL_SPEED * dt); moving = true; } }
+      moving ? requestAnimationFrame(f) : res(); })(last); });
+}
+async function resolve() {
+  let combo = 1;
+  for (;;) { const m = findMatches(); if (!m.length) break;
+    score += m.length * POINTS_PER_PIECE * combo; updHud();
+    await clearCells(m); await collapse(); combo++; }
+}
+async function trySwap(a, b) {
+  if (busy || gameOver) return; busy = true; selected = null;
+  if (grid[a[0]][a[1]].type === MYSTERY || grid[b[0]][b[1]].type === MYSTERY) { busy = false; return; }
+  await animateSwap(a, b);
+  if (findMatches().length) { moves++; updHud(); await resolve(); }
+  else await animateSwap(a, b);
+  busy = false;
+}
+
+// ===== Mystery piece =====
+function showModal(text, buttons) {
+  document.getElementById('msg').textContent = text;
+  const bd = document.getElementById('btns'); bd.innerHTML = '';
+  buttons.forEach(([label, fn]) => { const b = document.createElement('button'); b.textContent = label; b.style.margin = '0 6px'; b.onclick = fn; bd.appendChild(b); });
+  document.getElementById('modal').style.display = 'flex';
+}
+function hideModal() { document.getElementById('modal').style.display = 'none'; }
+function openMystery(c, r) {
+  busy = true;
+  showModal('A mysterious relic glows... Open it? Fortune or doom awaits!', [
+    ['Accept', async () => { hideModal();
+      if (Math.random() < MYSTERY_WIN_ODDS) {
+        score += MYSTERY_BONUS; updHud();
+        const row = []; for (let i = 0; i < COLS; i++) row.push([i, r]);
+        await clearCells(row); await collapse(); await resolve(); busy = false;
+        showModal('Treasure! +' + MYSTERY_BONUS + ' and the row is cleared.', [['Nice', hideModal]]);
+      } else { gameOver = true; busy = false;
+        showModal('Cursed! Game over. Final score: ' + score, [['Play again', init]]); }
+    }],
+    ['Decline', async () => { hideModal(); await clearCells([[c, r]]); await collapse(); await resolve(); busy = false; }]
+  ]);
+}
+
+// ===== Input =====
+let down = null;
+function cellAt(e) { const b = cv.getBoundingClientRect();
+  const c = Math.floor((e.clientX - b.left) / (b.width / COLS)), r = Math.floor((e.clientY - b.top) / (b.height / ROWS));
+  return c >= 0 && c < COLS && r >= 0 && r < ROWS ? [c, r] : null; }
+const adj = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) === 1;
+cv.addEventListener('pointerdown', e => { e.preventDefault(); if (busy || gameOver) return; const cell = cellAt(e); if (!cell) return;
+  if (grid[cell[0]][cell[1]].type === MYSTERY) { selected = null; openMystery(...cell); return; }
+  if (selected && adj(selected, cell)) { trySwap(selected, cell); return; }
+  selected = cell; down = { cell, x: e.clientX, y: e.clientY }; });
+cv.addEventListener('pointermove', e => { if (!down || busy) return;
+  const dx = e.clientX - down.x, dy = e.clientY - down.y; if (Math.max(Math.abs(dx), Math.abs(dy)) < DRAG_THRESHOLD) return;
+  const [c, r] = down.cell; const t = Math.abs(dx) > Math.abs(dy) ? [c + Math.sign(dx), r] : [c, r + Math.sign(dy)];
+  down = null; if (t[0] >= 0 && t[0] < COLS && t[1] >= 0 && t[1] < ROWS) trySwap([c, r], t); });
+window.addEventListener('pointerup', () => down = null);
+window.addEventListener('pointercancel', () => down = null);
+cv.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+document.getElementById('restart').onclick = () => { if (!busy) init(); };
+
+// ===== Drawing (original canvas art) =====
+const GEM = { ruby: ['#ff8a8a','#d0142c','#5a0010'], emerald: ['#9dffb8','#14a04a','#00401a'],
+  sapphire: ['#9cc8ff','#1f4fd8','#0a1a5a'], amethyst: ['#e2b0ff','#8a2ccf','#36084f'], topaz: ['#fff1a0','#f59e0b','#7a3e00'] };
+function poly(n, rad, rot) { ctx.beginPath(); for (let i = 0; i < n; i++) { const a = rot + i * Math.PI * 2 / n; ctx.lineTo(Math.cos(a) * rad, Math.sin(a) * rad); } ctx.closePath(); }
+function drawPiece(p, x, y, now) {
+  const R = TILE * 0.38; let s = 1, alpha = 1;
+  if (p.clear >= 0) { s = 1 + p.clear * 0.4; alpha = 1 - p.clear; }
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.globalAlpha = alpha;
+  if (p.type === 'coin') {
+    const g = ctx.createRadialGradient(-R*.3, -R*.3, 2, 0, 0, R);
+    g.addColorStop(0, '#fff6c0'); g.addColorStop(.5, '#ffc93a'); g.addColorStop(1, '#a8650a');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, R, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#8a5200'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, R*.72, 0, 7); ctx.stroke();
+    ctx.fillStyle = '#8a5200'; poly(5, R*.35, -Math.PI/2); ctx.fill();
+  } else if (p.type === MYSTERY) {
+    const pulse = .6 + .4 * Math.sin(now / 200);
+    ctx.shadowColor = '#fff'; ctx.shadowBlur = 18 * pulse;
+    const g = ctx.createRadialGradient(0, 0, 2, 0, 0, R);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(.5, `hsl(${(now/10)%360},90%,65%)`); g.addColorStop(1, '#222');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, R, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = '#1b1426'; ctx.font = `bold ${R}px Georgia`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('?', 0, 2);
+  } else {
+    const [hi, mid, lo] = GEM[p.type];
+    const shape = { ruby: [6, 0], emerald: [8, Math.PI/8], sapphire: [4, 0], amethyst: [3, -Math.PI/2], topaz: [5, -Math.PI/2] }[p.type];
+    const g = ctx.createLinearGradient(-R, -R, R, R); g.addColorStop(0, hi); g.addColorStop(.5, mid); g.addColorStop(1, lo);
+    ctx.fillStyle = g; poly(shape[0], R * (shape[0] === 3 ? 1.1 : 1), shape[1]); ctx.fill();
+    ctx.strokeStyle = lo; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.35)'; poly(shape[0], R * .5, shape[1]); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.8)'; ctx.beginPath(); ctx.arc(-R*.3, -R*.35, R*.12, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+function frame(now) {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS; r++) {
+    ctx.fillStyle = (c + r) % 2 ? '#3a2814' : '#33230f'; ctx.fillRect(c * TILE, r * TILE, TILE, TILE); }
+  if (selected) { ctx.strokeStyle = '#ffe066'; ctx.lineWidth = 3; ctx.strokeRect(selected[0]*TILE+2, selected[1]*TILE+2, TILE-4, TILE-4); }
+  for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS; r++) { const p = grid[c][r]; if (!p) continue;
+    if (p.dx || p.dy) p.y = r;
+    drawPiece(p, (c + p.dx + .5) * TILE, (p.y + p.dy + .5) * TILE, now); }
+  requestAnimationFrame(frame);
+}
+init(); requestAnimationFrame(frame);
+</script></body></html>
